@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "build_log.h"
+#include "build_result.h"
 #include "deps_log.h"
 #include "exit_status.h"
 #include "graph.h"
@@ -524,7 +525,7 @@ struct FakeCommandRunner : public CommandRunner {
   // CommandRunner impl
   virtual size_t CanRunMore() const;
   virtual bool StartCommand(Edge* edge);
-  virtual bool WaitForCommand(Result* result);
+  virtual BuildResult WaitForCommand();
   virtual vector<Edge*> GetActiveEdges();
   virtual void Abort();
 
@@ -652,6 +653,7 @@ bool FakeCommandRunner::StartCommand(Edge* edge) {
       edge->rule().name() == "cc" ||
       edge->rule().name() == "cp_multi_msvc" ||
       edge->rule().name() == "cp_multi_gcc" ||
+      edge->rule().name() == "cp_other" ||
       edge->rule().name() == "touch" ||
       edge->rule().name() == "touch-interrupt" ||
       edge->rule().name() == "touch-fail-tick2") {
@@ -672,6 +674,17 @@ bool FakeCommandRunner::StartCommand(Edge* edge) {
     if (fs_->ReadFile(edge->inputs_[0]->path(), &content, &err) ==
         DiskInterface::Okay)
       fs_->WriteFile(edge->outputs_[0]->path(), content, false);
+  } else if (edge->rule().name() == "cp_inputs_to_outputs") {
+    assert(!edge->inputs_.empty());
+    assert(edge->outputs_.size() == edge->inputs_.size());
+    string content;
+    string err;
+    for (size_t i = 0; i < edge->inputs_.size(); ++i) {
+      if (fs_->ReadFile(edge->inputs_[i]->path(), &content, &err) ==
+          DiskInterface::Okay) {
+        fs_->WriteFile(edge->outputs_[i]->path(), content, false);
+      }
+    }
   } else if (edge->rule().name() == "touch-implicit-dep-out") {
     string dep = edge->GetBinding("test_dependency");
     fs_->Tick();
@@ -732,9 +745,9 @@ bool FakeCommandRunner::StartCommand(Edge* edge) {
   return true;
 }
 
-bool FakeCommandRunner::WaitForCommand(Result* result) {
+BuildResult FakeCommandRunner::WaitForCommand() {
   if (active_edges_.empty())
-    return false;
+    return BuildResult::Finished{};
 
   // All active edges were already completed immediately when started,
   // so we can pick any edge here.  Pick the last edge.  Tests can
@@ -742,36 +755,36 @@ bool FakeCommandRunner::WaitForCommand(Result* result) {
   vector<Edge*>::iterator edge_iter = active_edges_.end() - 1;
 
   Edge* edge = *edge_iter;
-  result->edge = edge;
+  ExitStatus status;
+  std::string output;
 
   if (edge->rule().name() == "interrupt" ||
       edge->rule().name() == "touch-interrupt") {
-    result->status = ExitInterrupted;
-    return true;
+    return BuildResult::Interrupted{};
   }
 
   if (edge->rule().name() == "console") {
     if (edge->use_console())
-      result->status = ExitSuccess;
+      status = ExitSuccess;
     else
-      result->status = ExitFailure;
+      status = ExitFailure;
     active_edges_.erase(edge_iter);
-    return true;
+    return BuildResult::CommandCompleted{edge, status};
   }
 
   if (edge->rule().name() == "cp_multi_msvc") {
     const std::string prefix = edge->GetBinding("msvc_deps_prefix");
     for (std::vector<Node*>::iterator in = edge->inputs_.begin();
          in != edge->inputs_.end(); ++in) {
-      result->output += prefix + (*in)->path() + '\n';
+      output += prefix + (*in)->path() + '\n';
     }
   }
 
   if (edge->rule().name() == "fail" ||
       (edge->rule().name() == "touch-fail-tick2" && fs_->now_ == 2))
-    result->status = ExitFailure;
+    status = ExitFailure;
   else
-    result->status = ExitSuccess;
+    status = ExitSuccess;
 
   // This rule simulates an external process modifying files while the build command runs.
   // See TestInputMtimeRaceCondition and TestInputMtimeRaceConditionWithDepFile.
@@ -802,7 +815,7 @@ bool FakeCommandRunner::WaitForCommand(Result* result) {
   }
 
   active_edges_.erase(edge_iter);
-  return true;
+  return BuildResult::CommandCompleted{edge, status, output};
 }
 
 vector<Edge*> FakeCommandRunner::GetActiveEdges() {
@@ -4162,6 +4175,47 @@ TEST_F(BuildTest, DyndepTwoLevelDiscoveredDirty) {
   EXPECT_EQ("touch out", command_runner_.commands_ran_[4]);
 }
 
+TEST_F(BuildTest, DyndepBuildMultiple) {
+  // Verify that multiple dyndep files can be produced by one edge
+  // and loaded in the opposite order than their dependents will run.
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule touch\n"
+"  command = touch $out\n"
+"rule cp_inputs_to_outputs\n"
+"  command = cp dd3-in dd3 ; cp dd2-in dd2\n"
+"rule cp_other\n"
+"  command = cp out1 $out\n"
+"build dd3 dd2: cp_inputs_to_outputs dd3-in dd2-in\n"
+"build out3: touch in || dd3\n"
+"  dyndep = dd3\n"
+"build out2: cp_other || dd2\n"
+"  dyndep = dd2\n"
+"build out1: touch in\n"
+  ));
+  fs_.Create("in", "");
+  fs_.Create("dd3-in",
+"ninja_dyndep_version = 1\n"
+"build out3: dyndep | out2\n"
+);
+  fs_.Create("dd2-in",
+"ninja_dyndep_version = 1\n"
+"build out2: dyndep | out1\n"
+);
+
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("out2", &err));
+  EXPECT_TRUE(builder_.AddTarget("out3", &err));
+  EXPECT_EQ("", err);
+
+  EXPECT_EQ(builder_.Build(&err), ExitSuccess);
+  EXPECT_EQ("", err);
+  ASSERT_EQ(4u, command_runner_.commands_ran_.size());
+  EXPECT_EQ("cp dd3-in dd3 ; cp dd2-in dd2", command_runner_.commands_ran_[0]);
+  EXPECT_EQ("touch out1", command_runner_.commands_ran_[1]);
+  EXPECT_EQ("cp out1 out2", command_runner_.commands_ran_[2]);
+  EXPECT_EQ("touch out3", command_runner_.commands_ran_[3]);
+}
+
 TEST_F(BuildTest, Validation) {
   ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
     "build out: cat in |@ validate\n"
@@ -4404,4 +4458,19 @@ TEST_F(BuildTest, ValidationWithCircularDependency) {
   string err;
   EXPECT_FALSE(builder_.AddTarget("out", &err));
   EXPECT_EQ("dependency cycle: validate -> validate_in -> validate", err);
+}
+
+TEST_F(StateTestWithBuiltinRules, ComplexTargetPreserved) {
+  // Ensure targets containing spaces, percent-encoded sequences,
+  // and URL-reserved characters are preserved exactly during parsing.
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+    "rule copy\n"
+    "  command = cp $in $out\n"
+    "name = foo %2F bar?baz&x=1\n"
+    "build $name: copy foo\n"));
+
+  Node* node = state_.LookupNode("foo %2F bar?baz&x=1");
+  ASSERT_NE(node, nullptr);
+
+  EXPECT_EQ(node->path(), "foo %2F bar?baz&x=1");
 }

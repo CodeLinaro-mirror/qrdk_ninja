@@ -7,6 +7,7 @@ In order to simulate a smart terminal it uses the 'script' command.
 
 import os
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -385,6 +386,18 @@ ninja: build stopped: subcommand failed.
         output = run(Output.BUILD_SIMPLE_ECHO, flags='--quiet')
         self.assertEqual(output, 'do thing\n')
 
+    def test_status_flag(self) -> None:
+        'Does --status accept a Ninja-style $-format?'
+        output = run(Output.BUILD_SIMPLE_ECHO,
+                     flags="--status '<${finished}/${total}> '")
+        self.assertEqual(output, '<1/1> echo a\x1b[K\ndo thing\n')
+
+    def test_status_flag_unknown_variable(self) -> None:
+        'Does --status fail clearly on an unknown variable?'
+        self._test_expected_error(
+            Output.BUILD_SIMPLE_ECHO, "--status '$nope '",
+            "ninja: fatal: unknown variable 'nope' in --status format\n")
+
     def test_entering_directory_on_stdout(self) -> None:
         output = run(Output.BUILD_SIMPLE_ECHO, flags='-C$PWD', pipe=True)
         self.assertEqual(output.splitlines()[0][:25], "ninja: Entering directory")
@@ -600,6 +613,34 @@ out3<TAB>in3
                 [1/3] [ -e input ] || touch input
                 '''))
 
+    def test_explain_dyndep(self):
+        plan = dedent('''\
+            rule scan
+              command = printf 'ninja_dyndep_version = 1\\nbuild out | out.imp: dyndep\\n' > $out
+            rule touch
+              command = touch $out $out.imp
+            build dd: scan
+            build out: touch || dd
+              dyndep = dd
+            default out
+            ''')
+        # FIXME(#2759): "output out doesn't exist" is printed twice
+        output1 = dedent('''\
+            ninja explain: output dd doesn't exist
+            [1/2] printf 'ninja_dyndep_version = 1\\nbuild out | out.imp: dyndep\\n' > dd
+            ninja explain: loading dyndep file 'dd'
+            ninja explain: output out doesn't exist
+            ninja explain: output out doesn't exist
+            [2/2] touch out out.imp
+            ''')
+        output2 = dedent('''\
+            ninja explain: loading dyndep file 'dd'
+            ninja: no work to do.
+            ''')
+        with BuildDir(plan) as b:
+            self.assertEqual(b.run('-v -d explain'), output1)
+            self.assertEqual(b.run('-v -d explain'), output2)
+
     def test_issue_2586(self):
         """This shouldn't hang"""
         plan = '''rule echo
@@ -636,13 +677,22 @@ build stamp-1: touch || dd-1
 build stamp-2: touch || dd-2
   n = 2
 """
-        self._test_expected_error(
-            plan,
-            "-v",
-            r"""[1/4] printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1
-[2/4] printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2
-ninja: build stopped: multiple rules generate out.
-""",
+        # The two dd-N printfs run in parallel and may finish in either
+        # order, so compare the leading status lines as a set with the
+        # [N/4] progress prefix stripped.
+        with self.assertRaises(subprocess.CalledProcessError) as cm:
+            run(plan, "-v", print_err_output=False)
+        actual_lines = cm.exception.cooked_output.splitlines()
+        self.assertEqual(len(actual_lines), 3)
+        self.assertEqual(
+            {re.sub(r"^\[\d+/4\] ", "", line) for line in actual_lines[:2]},
+            {
+                r"printf 'ninja_dyndep_version = 1\nbuild stamp-1 | out: dyndep\n' > dd-1",
+                r"printf 'ninja_dyndep_version = 1\nbuild stamp-2 | out: dyndep\n' > dd-2",
+            },
+        )
+        self.assertEqual(
+            actual_lines[2], "ninja: build stopped: multiple rules generate out."
         )
 
     def test_issue_2681(self):
@@ -654,13 +704,13 @@ build foo: sleep
 """
         with BuildDir(plan) as b:
             for signum in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
-                proc = subprocess.Popen([NINJA_PATH, "foo"], cwd=b.path, env=default_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                # Sleep a bit to let Ninja start the build, otherwise the signal could be received
-                # before it, and returncode will be -2.
-                time.sleep(0.2)
-                os.kill(proc.pid, signum)
-                proc.wait()
-                self.assertEqual(proc.returncode, 130, msg=f"For signal {signum}")
+                with subprocess.Popen([NINJA_PATH, "foo"], cwd=b.path, env=default_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+                    # Sleep a bit to let Ninja start the build, otherwise the signal could be received
+                    # before it, and returncode will be -2.
+                    time.sleep(0.2)
+                    os.kill(proc.pid, signum)
+                    proc.wait()
+                    self.assertEqual(proc.returncode, 130, msg=f"For signal {signum}")
 
 
 if __name__ == '__main__':

@@ -234,6 +234,8 @@ void Usage(const BuildConfig& config) {
 "  --version      print ninja version (\"%s\")\n"
 "  -v, --verbose  show all command lines while building\n"
 "  --quiet        don't show progress status, just command output\n"
+"  --status FMT   progress status format using Ninja-style $vars\n"
+"                 (e.g. --status '[$finished/$total] ')\n"
 "\n"
 "  -C DIR   change to DIR before doing anything else\n"
 "  -f FILE  specify input build file [default=build.ninja]\n"
@@ -331,6 +333,18 @@ Node* NinjaMain::CollectTarget(const char* cpath, string* err) {
   }
 
   Node* node = state_.LookupNode(path);
+  if (!node && !build_dir_.empty()) {
+    // if 'foo' is not found, try to fallback to $build_dir/foo when build_dir
+    // is set in the manifest
+    std::string builddir_path = build_dir_ + "/" + path;
+    uint64_t builddir_slash_bits;
+    CanonicalizePath(&builddir_path, &builddir_slash_bits);
+    node = state_.LookupNode(builddir_path);
+    if (node) {
+      path = builddir_path;
+      slash_bits = builddir_slash_bits;
+    }
+  }
   if (node) {
     if (first_dependent) {
       if (node->out_edges().empty()) {
@@ -1011,6 +1025,18 @@ std::string EvaluateCommandWithRspfile(const Edge* edge,
   return command;
 }
 
+/// Returns true if this edge's outputs are only used as validation
+/// dependencies by other edges, not as regular build inputs.
+bool IsValidationOnlyEdge(const Edge* edge) {
+  for (const Node* output : edge->outputs_) {
+    if (output->validation_out_edges().empty() ||
+        !output->out_edges().empty()) {
+      return false;
+    }
+  }
+  return !edge->outputs_.empty();
+}
+
 void PrintCompdbObjectsForEdge(std::string const& directory, const Edge* const edge,
                                const EvaluateCommandMode eval_mode) {
   const auto& command = EvaluateCommandWithRspfile(edge, eval_mode);
@@ -1070,7 +1096,7 @@ int NinjaMain::ToolCompilationDatabase(const Options* options, int argc,
   std::string directory = GetWorkingDirectory();
   putchar('[');
   for (const Edge* edge : state_.edges_) {
-    if (edge->inputs_.empty())
+    if (edge->inputs_.empty() || IsValidationOnlyEdge(edge))
       continue;
     if (argc == 0) {
       if (!first) {
@@ -1114,19 +1140,24 @@ int NinjaMain::ToolRestat(const Options* options, int argc, char* argv[]) {
 
   optind = 1;
   int opt;
-  while ((opt = getopt(argc, argv, const_cast<char*>("h"))) != -1) {
+  const option kLongOptions[] = { { "builddir", required_argument, nullptr,
+                                    'b' },
+                                  { "help", no_argument, nullptr, 'h' },
+                                  { nullptr, 0, nullptr, 0 } };
+  while ((opt = getopt_long(argc, argv, const_cast<char*>("h"), kLongOptions,
+                            nullptr)) != -1) {
     switch (opt) {
+    case 'b':
+      build_dir_ = optarg;
+      break;
     case 'h':
     default:
-      printf("usage: ninja -t restat [outputs]\n");
+      printf("usage: ninja -t restat [--builddir=DIR] [outputs]\n");
       return 1;
     }
   }
   argv += optind;
   argc -= optind;
-
-  if (!EnsureBuildDirExists())
-    return 1;
 
   string log_path = ".ninja_log";
   if (!build_dir_.empty())
@@ -1223,7 +1254,7 @@ void PrintCompdb(std::string const& directory, std::vector<Edge*> const& edges,
 
   bool first = true;
   for (const Edge* edge : edges) {
-    if (edge->is_phony() || edge->inputs_.empty())
+    if (edge->is_phony() || edge->inputs_.empty() || IsValidationOnlyEdge(edge))
       continue;
     if (!first)
       putchar(',');
@@ -1700,12 +1731,13 @@ int ReadFlags(int* argc, char*** argv,
               Options* options, BuildConfig* config) {
   DeferGuessParallelism deferGuessParallelism(config);
 
-  enum { OPT_VERSION = 1, OPT_QUIET = 2 };
+  enum { OPT_VERSION = 1, OPT_QUIET = 2, OPT_STATUS = 3 };
   const option kLongOptions[] = {
     { "help", no_argument, NULL, 'h' },
     { "version", no_argument, NULL, OPT_VERSION },
     { "verbose", no_argument, NULL, 'v' },
     { "quiet", no_argument, NULL, OPT_QUIET },
+    { "status", required_argument, NULL, OPT_STATUS },
     { NULL, 0, NULL, 0 }
   };
 
@@ -1770,6 +1802,9 @@ int ReadFlags(int* argc, char*** argv,
         break;
       case OPT_QUIET:
         config->verbosity = BuildConfig::NO_STATUS_UPDATE;
+        break;
+      case OPT_STATUS:
+        config->progress_status_format = optarg;
         break;
       case 'w':
         if (!WarningEnable(optarg, options))

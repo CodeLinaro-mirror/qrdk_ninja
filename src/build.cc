@@ -51,7 +51,7 @@ struct DryRunCommandRunner : public CommandRunner {
   // Overridden from CommandRunner:
   size_t CanRunMore() const override;
   bool StartCommand(Edge* edge) override;
-  bool WaitForCommand(Result* result) override;
+  BuildResult WaitForCommand() override;
 
  private:
   queue<Edge*> finished_;
@@ -66,14 +66,15 @@ bool DryRunCommandRunner::StartCommand(Edge* edge) {
   return true;
 }
 
-bool DryRunCommandRunner::WaitForCommand(Result* result) {
-   if (finished_.empty())
-     return false;
+BuildResult DryRunCommandRunner::WaitForCommand() {
+  if (finished_.empty())
+    return BuildResult::Finished{};
 
-   result->status = ExitSuccess;
-   result->edge = finished_.front();
-   finished_.pop();
-   return true;
+  auto status = ExitSuccess;
+  auto edge = finished_.front();
+  finished_.pop();
+
+  return BuildResult::CommandCompleted{ edge, status };
 }
 
 }  // namespace
@@ -221,6 +222,11 @@ bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
   want_.erase(e);
   edge->outputs_ready_ = true;
 
+  // Load dyndep info provided by this edge's outputs.
+  if (builder_ && !builder_->LoadDyndeps(edge, err)) {
+    return false;
+  }
+
   // Check off any nodes we were waiting for with this edge.
   for (vector<Node*>::iterator o = edge->outputs_.begin();
        o != edge->outputs_.end(); ++o) {
@@ -231,14 +237,6 @@ bool Plan::EdgeFinished(Edge* edge, EdgeResult result, string* err) {
 }
 
 bool Plan::NodeFinished(Node* node, string* err) {
-  // If this node provides dyndep info, load it now.
-  if (node->dyndep_pending()) {
-    assert(builder_ && "dyndep requires Plan to have a Builder");
-    // Load the now-clean dyndep file.  This will also update the
-    // build plan and schedule any new work that is ready.
-    return builder_->LoadDyndeps(node, err);
-  }
-
   // See if we we want any edges from this node.
   for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
        oe != node->out_edges().end(); ++oe) {
@@ -287,12 +285,7 @@ bool Plan::CleanNode(DependencyScan* scan, Node* node, string* err) {
     vector<Node*>::iterator
         begin = (*oe)->inputs_.begin(),
         end = (*oe)->inputs_.end() - (*oe)->order_only_deps_;
-#if __cplusplus < 201703L
-#define MEM_FN mem_fun
-#else
-#define MEM_FN mem_fn  // mem_fun was removed in C++17.
-#endif
-    if (find_if(begin, end, MEM_FN(&Node::dirty)) == end) {
+    if (find_if(begin, end, mem_fn(&Node::dirty)) == end) {
       // Recompute most_recent_input.
       Node* most_recent_input = NULL;
       for (vector<Node*>::iterator i = begin; i != end; ++i) {
@@ -328,21 +321,25 @@ bool Plan::CleanNode(DependencyScan* scan, Node* node, string* err) {
   return true;
 }
 
-bool Plan::DyndepsLoaded(DependencyScan* scan, const Node* node,
-                         const DyndepFile& ddf, string* err) {
+bool Plan::DyndepsLoaded(DependencyScan* scan,
+                         const std::vector<Node*>& dyndep_nodes,
+                         const std::unordered_map<Edge*, Dyndeps>& dyndep_edges,
+                         std::string* err) {
   // Recompute the dirty state of all our direct and indirect dependents now
   // that our dyndep information has been loaded.
-  if (!RefreshDyndepDependents(scan, node, err))
+  if (!RefreshDyndepDependents(scan, dyndep_nodes, err))
     return false;
 
-  // We loaded dyndep information for those out_edges of the dyndep node that
-  // specify the node in a dyndep binding, but they may not be in the plan.
+  // We loaded dyndep information for those out_edges of the dyndep nodes that
+  // specify one of them in a dyndep binding, but they may not be in the plan.
   // Starting with those already in the plan, walk newly-reachable portion
   // of the graph through the dyndep-discovered dependencies.
 
   // Find edges in the the build plan for which we have new dyndep info.
-  std::vector<DyndepFile::const_iterator> dyndep_roots;
-  for (DyndepFile::const_iterator oe = ddf.begin(); oe != ddf.end(); ++oe) {
+  std::vector<std::unordered_map<Edge*, Dyndeps>::const_iterator> dyndep_roots;
+  for (std::unordered_map<Edge*, Dyndeps>::const_iterator oe =
+           dyndep_edges.begin();
+       oe != dyndep_edges.end(); ++oe) {
     Edge* edge = oe->first;
 
     // If the edge outputs are ready we do not need to consider it here.
@@ -362,9 +359,10 @@ bool Plan::DyndepsLoaded(DependencyScan* scan, const Node* node,
 
   // Walk dyndep-discovered portion of the graph to add it to the build plan.
   std::set<Edge*> dyndep_walk;
-  for (std::vector<DyndepFile::const_iterator>::iterator
-       oei = dyndep_roots.begin(); oei != dyndep_roots.end(); ++oei) {
-    DyndepFile::const_iterator oe = *oei;
+  for (std::vector<std::unordered_map<Edge*, Dyndeps>::const_iterator>::iterator
+           oei = dyndep_roots.begin();
+       oei != dyndep_roots.end(); ++oei) {
+    std::unordered_map<Edge*, Dyndeps>::const_iterator oe = *oei;
     for (vector<Node*>::const_iterator i = oe->second.implicit_inputs_.begin();
          i != oe->second.implicit_inputs_.end(); ++i) {
       if (!AddSubTarget(*i, oe->first->outputs_[0], err, &dyndep_walk) &&
@@ -373,14 +371,16 @@ bool Plan::DyndepsLoaded(DependencyScan* scan, const Node* node,
     }
   }
 
-  // Add out edges from this node that are in the plan (just as
+  // Add dyndep node out edges that are in the plan (just as
   // Plan::NodeFinished would have without taking the dyndep code path).
-  for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
-       oe != node->out_edges().end(); ++oe) {
-    map<Edge*, Want>::iterator want_e = want_.find(*oe);
-    if (want_e == want_.end())
-      continue;
-    dyndep_walk.insert(want_e->first);
+  for (Node* node : dyndep_nodes) {
+    for (vector<Edge*>::const_iterator oe = node->out_edges().begin();
+         oe != node->out_edges().end(); ++oe) {
+      map<Edge*, Want>::iterator want_e = want_.find(*oe);
+      if (want_e == want_.end())
+        continue;
+      dyndep_walk.insert(want_e->first);
+    }
   }
 
   // See if any encountered edges are now ready.
@@ -396,12 +396,15 @@ bool Plan::DyndepsLoaded(DependencyScan* scan, const Node* node,
   return true;
 }
 
-bool Plan::RefreshDyndepDependents(DependencyScan* scan, const Node* node,
+bool Plan::RefreshDyndepDependents(DependencyScan* scan,
+                                   const std::vector<Node*>& dyndep_nodes,
                                    string* err) {
   // Collect the transitive closure of dependents and mark their edges
   // as not yet visited by RecomputeDirty.
   set<Node*> dependents;
-  UnmarkDependents(node, &dependents);
+  for (Node* node : dyndep_nodes) {
+    UnmarkDependents(node, &dependents);
+  }
 
   // Update the dirty state of all dependents and check if their edges
   // have become wanted.
@@ -609,7 +612,7 @@ Builder::Builder(State* state, const BuildConfig& config, BuildLog* build_log,
                  Status* status, int64_t start_time_millis)
     : state_(state), config_(config), plan_(this), status_(status),
       start_time_millis_(start_time_millis), disk_interface_(disk_interface),
-      explanations_(g_explaining ? new Explanations() : nullptr),
+      explanations_(g_explaining ? new Explanations(status) : nullptr),
       scan_(state, build_log, deps_log, disk_interface,
             &config_.depfile_parser_options, explanations_.get()) {
   lock_file_path_ = ".ninja_lock";
@@ -768,33 +771,55 @@ ExitStatus Builder::Build(string* err) {
 
     // See if we can reap any finished commands.
     if (pending_commands) {
-      CommandRunner::Result result;
-      if (!command_runner_->WaitForCommand(&result) ||
-          result.status == ExitInterrupted) {
+      // Tell command runner that if jobserver tokens become available while
+      // waiting, it should notify us - but only if we have more work to do.
+      const bool watch_jobserver = plan_.work_ready();
+      BuildResult result =
+          command_runner_->WaitForCommandOrJobserverToken(watch_jobserver);
+
+      if (result.finished()) {
+        // Shouldn't be possible, since we assumed that there
+        // are still pending commands
+        Fatal("internal error");
+      }
+
+      if (result.interrupted() || result.exit_status() == ExitInterrupted) {
         Cleanup();
         status_->BuildFinished();
         *err = "interrupted by user";
-        return result.status;
-      }
-
-      --pending_commands;
-      bool command_finished = FinishCommand(&result, err);
-      SetFailureCode(result.status);
-      if (!command_finished) {
-        Cleanup();
-        status_->BuildFinished();
-        if (result.success()) {
-          // If the command pretend succeeded, the status wasn't set to a proper exit code,
-          // so we set it to ExitFailure.
-          result.status = ExitFailure;
-          SetFailureCode(result.status);
+        return result.exit_status();
+      } else if (result.command_completed()) {
+        // We know that the result is from a completed command
+        BuildResult::CommandCompleted& cc = result.GetCommandCompleted();
+        --pending_commands;
+        bool command_finished = FinishCommand(cc, err);
+        SetFailureCode(result.exit_status());
+        if (!command_finished) {
+          Cleanup();
+          status_->BuildFinished();
+          if (result.success()) {
+            // If the command pretend succeeded, the status wasn't set to a
+            // proper exit code, so we set it to ExitFailure.
+            cc.status = ExitFailure;
+            SetFailureCode(result.exit_status());
+          }
+          return result.exit_status();
         }
-        return result.status;
-      }
 
-      if (!result.success()) {
-        if (failures_allowed)
-          failures_allowed--;
+        if (!result.success()) {
+          if (failures_allowed)
+            failures_allowed--;
+        }
+      } else if (result.jobserver_token_available()) {
+        // Note: currently we only react to jobserver tokens availability
+        // on non-Windows platforms.
+
+        // Jobserver token is available; start main loop over to try to
+        // acquire jobserver token.
+        continue;
+      } else {
+        // Should be unreachable
+        Fatal("internal bug: unexpected BuildResult state");
       }
 
       // We made some progress; start the main loop over.
@@ -873,10 +898,11 @@ bool Builder::StartEdge(Edge* edge, string* err) {
   return true;
 }
 
-bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
+bool Builder::FinishCommand(BuildResult::CommandCompleted& result,
+                            string* err) {
   METRIC_RECORD("FinishCommand");
 
-  Edge* edge = result->edge;
+  Edge* edge = result.edge;
 
   // First try to extract dependencies from the result, if any.
   // This must happen first as it filters the command output (we want
@@ -890,11 +916,11 @@ bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
     string extract_err;
     if (!ExtractDeps(result, deps_type, deps_prefix, &deps_nodes,
                      &extract_err) &&
-        result->success()) {
-      if (!result->output.empty())
-        result->output.append("\n");
-      result->output.append(extract_err);
-      result->status = ExitFailure;
+        result.success()) {
+      if (!result.output.empty())
+        result.output.append("\n");
+      result.output.append(extract_err);
+      result.status = ExitFailure;
     }
   }
 
@@ -905,10 +931,10 @@ bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
   running_edges_.erase(it);
 
   status_->BuildEdgeFinished(edge, start_time_millis, end_time_millis,
-                             result->status, result->output);
+                             result.status, result.output);
 
   // The rest of this function only applies to successful commands.
-  if (!result->success()) {
+  if (!result.success()) {
     return plan_.EdgeFinished(edge, Plan::kEdgeFailed, err);
   }
 
@@ -981,17 +1007,15 @@ bool Builder::FinishCommand(CommandRunner::Result* result, string* err) {
   return true;
 }
 
-bool Builder::ExtractDeps(CommandRunner::Result* result,
-                          const string& deps_type,
-                          const string& deps_prefix,
-                          vector<Node*>* deps_nodes,
-                          string* err) {
+bool Builder::ExtractDeps(BuildResult::CommandCompleted& result,
+                          const string& deps_type, const string& deps_prefix,
+                          vector<Node*>* deps_nodes, string* err) {
   if (deps_type == "msvc") {
     CLParser parser;
     string output;
-    if (!parser.Parse(result->output, deps_prefix, &output, err))
+    if (!parser.Parse(result.output, deps_prefix, &output, err))
       return false;
-    result->output = output;
+    result.output = output;
     for (set<string>::iterator i = parser.includes_.begin();
          i != parser.includes_.end(); ++i) {
       // ~0 is assuming that with MSVC-parsed headers, it's ok to always make
@@ -1001,7 +1025,7 @@ bool Builder::ExtractDeps(CommandRunner::Result* result,
       deps_nodes->push_back(state_->GetNode(*i, ~0u));
     }
   } else if (deps_type == "gcc") {
-    string depfile = result->edge->GetUnescapedDepfile();
+    string depfile = result.edge->GetUnescapedDepfile();
     if (depfile.empty()) {
       *err = string("edge with deps=gcc but no depfile makes no sense");
       return false;
@@ -1047,17 +1071,25 @@ bool Builder::ExtractDeps(CommandRunner::Result* result,
   return true;
 }
 
-bool Builder::LoadDyndeps(Node* node, string* err) {
-  // Load the dyndep information provided by this node.
-  DyndepFile ddf;
-  if (!scan_.LoadDyndeps(node, &ddf, err))
-    return false;
+bool Builder::LoadDyndeps(Edge* edge, string* err) {
+  // Load the dyndep information provided by this edge's outputs.
+  std::vector<Node*> dyndep_nodes;
+  std::unordered_map<Edge*, Dyndeps> dyndep_edges;
+  for (Node* node : edge->outputs_) {
+    if (node->dyndep_pending()) {
+      // Load the dyndep information provided by this now-clean node.
+      DyndepFile ddf;
+      if (!scan_.LoadDyndeps(node, &ddf, err)) {
+        return false;
+      }
+      dyndep_nodes.emplace_back(node);
+      dyndep_edges.insert(std::make_move_iterator(ddf.begin()),
+                          std::make_move_iterator(ddf.end()));
+    }
+  }
 
   // Update the build plan to account for dyndep modifications to the graph.
-  if (!plan_.DyndepsLoaded(&scan_, node, ddf, err))
-    return false;
-
-  return true;
+  return plan_.DyndepsLoaded(&scan_, dyndep_nodes, dyndep_edges, err);
 }
 
 void Builder::SetFailureCode(ExitStatus code) {

@@ -332,6 +332,7 @@ if platform.is_msvc():
     cflags = ['/showIncludes',
               '/nologo',  # Don't print startup banner.
               '/utf-8',
+              '/std:c++17',
               '/Zi',  # Create pdb with debug info.
               '/W4',  # Highest warning level.
               '/WX',  # Warnings as errors.
@@ -366,7 +367,7 @@ else:
               '-Wno-unused-parameter',
               '-fno-rtti',
               '-fno-exceptions',
-              '-std=c++14',
+              '-std=c++17',
               '-fvisibility=hidden', '-pipe',
               '-DNINJA_PYTHON="%s"' % options.with_python]
     if options.warnings_as_errors:
@@ -383,7 +384,7 @@ else:
             stdout=open(os.devnull, 'wb'), stderr=subprocess.STDOUT)
         if proc.wait() == 0:
             cflags += ['-fdiagnostics-color']
-    except:
+    except Exception:
         pass
     if platform.is_mingw():
         cflags += ['-D_WIN32_WINNT=0x0601', '-D__USE_MINGW_ANSI_STDIO=1']
@@ -548,6 +549,7 @@ for name in ['build',
              'edit_distance',
              'elide_middle',
              'eval_env',
+             'explanations',
              'graph',
              'graphviz',
              'jobserver',

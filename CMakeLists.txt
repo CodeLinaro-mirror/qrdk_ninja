@@ -13,7 +13,6 @@ check_ipo_supported(RESULT lto_supported OUTPUT error)
 
 if(lto_supported)
 	message(STATUS "IPO / LTO enabled")
-	set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 	set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 else()
 	message(STATUS "IPO / LTO not supported: <${error}>")
@@ -137,6 +136,7 @@ add_library(libninja OBJECT
 	src/edit_distance.cc
 	src/elide_middle.cc
 	src/eval_env.cc
+	src/explanations.cc
 	src/graph.cc
 	src/graphviz.cc
 	src/jobserver.cc
@@ -163,11 +163,6 @@ if(WIN32)
 		src/getopt.c
 		src/minidump-win32.cc
 	)
-	# Build getopt.c, which can be compiled as either C or C++, as C++
-	# so that build environments which lack a C compiler, but have a C++
-	# compiler may build ninja.
-	set_source_files_properties(src/getopt.c PROPERTIES LANGUAGE CXX)
-
 	# windows.h defines min() and max() which conflict with std::min()
 	# and std::max(), which both might be used in sources. Avoid compile
 	# errors by telling windows.h to not define those two.
@@ -179,10 +174,6 @@ else()
 	)
 	if(CMAKE_SYSTEM_NAME STREQUAL "OS400" OR CMAKE_SYSTEM_NAME STREQUAL "AIX")
 		target_sources(libninja PRIVATE src/getopt.c)
-		# Build getopt.c, which can be compiled as either C or C++, as C++
-		# so that build environments which lack a C compiler, but have a C++
-		# compiler may build ninja.
-		set_source_files_properties(src/getopt.c PROPERTIES LANGUAGE CXX)
 	endif()
 
 	# Needed for perfstat_cpu_total
@@ -190,9 +181,16 @@ else()
 		target_link_libraries(libninja PUBLIC "-lperfstat")
 	endif()
 endif()
+get_property(_src_ninja TARGET libninja PROPERTY SOURCES)
+if("src/getopt.c" IN_LIST _src_ninja)
+	# Build getopt.c, which can be compiled as either C or C++, as C++
+	# so that build environments which lack a C compiler, but have a C++
+	# compiler may build ninja.
+	set_property(SOURCE src/getopt.c PROPERTY LANGUAGE CXX)
+endif()
 
-target_compile_features(libninja PUBLIC cxx_std_14)
-target_compile_features(libninja-re2c PUBLIC cxx_std_14)
+target_compile_features(libninja PUBLIC cxx_std_17)
+target_compile_features(libninja-re2c PUBLIC cxx_std_17)
 
 #Fixes GetActiveProcessorCount on MinGW
 if(MINGW)
@@ -216,8 +214,7 @@ if(NINJA_BUILD_BINARY)
 
 	option(NINJA_CLANG_TIDY "Run clang-tidy on source files" OFF)
 	if(NINJA_CLANG_TIDY)
-		set_target_properties(libninja PROPERTIES CXX_CLANG_TIDY "clang-tidy;--use-color")
-		set_target_properties(ninja    PROPERTIES CXX_CLANG_TIDY "clang-tidy;--use-color")
+		set_target_properties(libninja-re2c libninja ninja PROPERTIES CXX_CLANG_TIDY "clang-tidy;--use-color")
 	endif()
 endif()
 
@@ -262,8 +259,8 @@ if(BUILD_TESTING)
     include(FetchContent)
     FetchContent_Declare(
       googletest
-      # GoogleTest v1.17.0 requires at least C++17 and cmake 3.16 which are above ninja project minimum requirements.
-      # GoogleTest v1.16.0 requires at least C++14 and cmake 3.13 which are within the ninja project minimum requirements.
+      # GoogleTest v1.17.0 requires at least cmake 3.16, v1.16.0 requires at least cmake 3.13 which
+	  # is within the ninja project minimum requirement.
       URL https://github.com/google/googletest/releases/download/v1.16.0/googletest-1.16.0.tar.gz
       URL_HASH SHA256=78c676fc63881529bf97bf9d45948d905a66833fbfa5318ea2cd7478cb98f399
     )
@@ -291,6 +288,7 @@ if(BUILD_TESTING)
     src/missing_deps_test.cc
     src/ninja_test.cc
     src/state_test.cc
+    src/string_piece_test.cc
     src/string_piece_util_test.cc
     src/subprocess_test.cc
     src/test.cc
